@@ -5,6 +5,10 @@ I_sceAtaWaitResult
 I_sceAtaDmaTransfer
 atad_IMPORTS_end
 
+loadcore_IMPORTS_start
+I_GetLoadcoreInternalData
+loadcore_IMPORTS_end
+
 ioman_IMPORTS_start
 I_AddDrv
 ioman_IMPORTS_end

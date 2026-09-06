@@ -3,6 +3,8 @@
 
 #include "opl-hdd-ioctl.h"
 
+#define APA_MAGIC 0x00415041 // "APA\0" as a little-endian u32.
+
 typedef struct
 {
     u32 start;  // Sector address

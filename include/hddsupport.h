@@ -22,8 +22,9 @@ typedef struct
     u8 dma_mode;
     u8 disctype;
     u32 layer_break;
-    u32 start_sector;
+    u32 start_sector;    // Bank-relative HDL metadata sector.
     u32 total_size_in_kb;
+    u32 bank_index;      // Runtime-only 2-TiB bank index. Bank 0 is ordinary APA.
 } hdl_game_info_t;
 
 typedef struct

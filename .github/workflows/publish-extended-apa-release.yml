@@ -1,0 +1,93 @@
+name: Publish Extended APA hardware-tested release
+
+on:
+  push:
+    branches:
+      - release/extended-apa-public
+    paths:
+      - .github/workflows/publish-extended-apa-release.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TESTED_COMMIT: b2e39f0d6b569cf79a3235dc47050016d102cd31
+      TESTED_RUN_ID: "34034644295"
+      TESTED_SHA256: aa7d6765f88fec8d059ebb4fafc76e75e5cd8f8820e083fec0f45640ed32a244
+      TAG: v1.2.0-Beta-2273-Extended-APA-1
+      RELEASE_TITLE: Open PS2 Loader Extended APA - Hardware-Tested Release 1
+      RELEASE_ASSET: OPNPS2LD-Extended-APA-v1.2.0-Beta-2273.ELF
+    steps:
+      - name: Checkout release documentation
+        uses: actions/checkout@v4
+
+      - name: Download exact CI artifact used for hardware test
+        uses: actions/download-artifact@v4
+        with:
+          name: OPNPS2LD
+          run-id: ${{ env.TESTED_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: tested-artifact
+
+      - name: Verify and prepare pinned ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t candidates < <(find tested-artifact -type f -iname 'OPNPS2LD*.ELF' -print)
+          if (( ${#candidates[@]} != 1 )); then
+            printf 'Expected exactly one main OPNPS2LD ELF, found %d\n' "${#candidates[@]}" >&2
+            find tested-artifact -maxdepth 3 -type f -print >&2
+            exit 1
+          fi
+          cp "${candidates[0]}" "$RELEASE_ASSET"
+          actual="$(sha256sum "$RELEASE_ASSET" | awk '{print $1}')"
+          if [[ "$actual" != "$TESTED_SHA256" ]]; then
+            echo "SHA-256 mismatch: expected $TESTED_SHA256, got $actual" >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$TESTED_SHA256" "$RELEASE_ASSET" > SHA256SUMS.txt
+          echo "Verified exact hardware-tested ELF: $actual"
+
+      - name: Create or refresh prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TITLE" \
+              --notes-file RELEASE_NOTES_EXTENDED_APA_1.md \
+              --prerelease
+            gh release upload "$TAG" \
+              "$RELEASE_ASSET" SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              "$RELEASE_ASSET" SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$TESTED_COMMIT" \
+              --title "$RELEASE_TITLE" \
+              --notes-file RELEASE_NOTES_EXTENDED_APA_1.md \
+              --prerelease
+          fi
+
+      - name: Confirm published asset checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf verify-download
+          mkdir verify-download
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$RELEASE_ASSET" --dir verify-download
+          actual="$(sha256sum "verify-download/$RELEASE_ASSET" | awk '{print $1}')"
+          [[ "$actual" == "$TESTED_SHA256" ]]
+          echo "Release download verified: $actual"

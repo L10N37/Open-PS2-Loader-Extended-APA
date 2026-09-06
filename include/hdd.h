@@ -1,6 +1,9 @@
 #ifndef __HDD_H
 #define __HDD_H
 
+#include <fileXio_rpc.h>
+#include "opl-hdd-ioctl.h"
+
 typedef struct
 {
     u32 start;  // Sector address
@@ -86,10 +89,38 @@ typedef struct
 
 int hddReadSectors(u32 lba, u32 nsectors, void *buf);
 
-/* OPL-private helpers for the banked-HDD scanner. These do not widen or
-   replace Sony's existing 32-bit APA/PFS interfaces. */
-int hddReadSectors64(u64 lba, u32 nsectors, void *buf);
-int hddGetTotalSectors64(u64 *sectors);
+/* OPL-private helpers for the banked-HDD scanner. These do not change the
+   Sony/APA 32-bit API above; they talk only to OPL's xhdd devctl layer. */
+static inline int hddReadSectors64(u64 lba, u32 nsectors, void *buf)
+{
+    hddAtaRead64_t request;
+
+    if (nsectors == 0)
+        return -1;
+
+    request.lba_lo = (u32)lba;
+    request.lba_hi = (u32)(lba >> 32);
+    request.size = nsectors;
+
+    return fileXioDevctl("xhdd0:", ATA_DEVCTL_READ_SECTORS64,
+                         &request, sizeof(request), buf, nsectors * 512);
+}
+
+static inline int hddGetTotalSectors64(u64 *sectors)
+{
+    hddLba64_t result;
+    int status;
+
+    if (sectors == NULL)
+        return -1;
+
+    status = fileXioDevctl("xhdd0:", ATA_DEVCTL_GET_TOTAL_SECTORS64,
+                           NULL, 0, &result, sizeof(result));
+    if (status == 0)
+        *sectors = ((u64)result.hi << 32) | result.lo;
+
+    return status;
+}
 
 // Array should be APA_MAXSUB+1 entries.
 int hddGetPartitionInfo(const char *name, apa_sub_t *parts);

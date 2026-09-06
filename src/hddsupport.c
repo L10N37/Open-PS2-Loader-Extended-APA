@@ -12,6 +12,7 @@
 #include "include/extern_irx.h"
 #include "include/cheatman.h"
 #include "modules/iopcore/common/cdvd_config.h"
+#include "modules/hdd/common/opl-hdd-ioctl.h"
 
 #define NEWLIB_PORT_AWARE
 #include <fileXio_rpc.h> // fileXioFormat, fileXioMount, fileXioUmount, fileXioDevctl
@@ -20,6 +21,8 @@
 #include <hdd-ioctl.h>
 
 #define OPL_HDD_MODE_PS2LOGO_OFFSET 0x17F8
+#define HDD_BANK_PATCH_BIAS         0x10
+#define HDD_BANKED_CACHE_FILE       "games_banked.bin"
 
 #include "../modules/isofs/zso.h"
 
@@ -41,6 +44,39 @@ static item_list_t hddGameList;
 
 static int hddLoadGameListCache(hdl_games_list_t *cache);
 static int hddUpdateGameListCache(hdl_games_list_t *cache, hdl_games_list_t *game_list);
+
+/* OPL-private 64-bit physical HDD helpers. Sony's hdd.irx API remains 32-bit;
+   these requests go only through our xhdd devctl bridge. */
+int hddReadSectors64(u64 lba, u32 nsectors, void *buf)
+{
+    hddAtaRead64_t request;
+
+    if (nsectors == 0 || buf == NULL)
+        return -EINVAL;
+
+    request.lba_lo = (u32)lba;
+    request.lba_hi = (u32)(lba >> 32);
+    request.size = nsectors;
+
+    return fileXioDevctl("xhdd0:", ATA_DEVCTL_READ_SECTORS64,
+                         &request, sizeof(request), buf, nsectors * 512);
+}
+
+int hddGetTotalSectors64(u64 *sectors)
+{
+    hddLba64_t result;
+    int status;
+
+    if (sectors == NULL)
+        return -EINVAL;
+
+    status = fileXioDevctl("xhdd0:", ATA_DEVCTL_GET_TOTAL_SECTORS64,
+                           NULL, 0, &result, sizeof(result));
+    if (status == 0)
+        *sectors = ((u64)result.hi << 32) | result.lo;
+
+    return status;
+}
 
 static void hddInitModules(void)
 {
@@ -416,6 +452,11 @@ static char *hddGetGameStartup(item_list_t *itemList, int id)
 
 static void hddDeleteGame(item_list_t *itemList, int id)
 {
+    if (hddGames.games[id].bank_index != 0) {
+        guiWarning("Upper-bank games are read-only in this experimental build.", 8);
+        return;
+    }
+
     hddDeleteHDLGame(&hddGames.games[id]);
     hddForceUpdate = 1;
 }
@@ -423,6 +464,12 @@ static void hddDeleteGame(item_list_t *itemList, int id)
 static void hddRenameGame(item_list_t *itemList, int id, char *newName)
 {
     hdl_game_info_t *game = &hddGames.games[id];
+
+    if (game->bank_index != 0) {
+        guiWarning("Upper-bank games are read-only in this experimental build.", 8);
+        return;
+    }
+
     strcpy(game->name, newName);
     hddSetHDLGameInfo(&hddGames.games[id]);
     hddForceUpdate = 1;
@@ -442,6 +489,16 @@ void hddLaunchGame(item_list_t *itemList, int id, config_set_t *configSet)
         game = &hddGames.games[id];
     else
         game = gAutoLaunchGame;
+
+    if (game->bank_index > 0xff) {
+        guiWarning("HDD bank index is outside this experimental build's range.", 8);
+        return;
+    }
+
+    if (hddHDProKitDetected && game->bank_index != 0) {
+        guiWarning("HD Pro upper-bank launching is not supported by this experimental build.", 8);
+        return;
+    }
 
     apa_sub_t parts[APA_MAXSUB + 1];
     char vmc_name[2][32];
@@ -575,27 +632,37 @@ void hddLaunchGame(item_list_t *itemList, int id, config_set_t *configSet)
     // patch 48bit flag
     settings->common.media = hddIs48bit() & 0xff;
 
-    // patch start_sector
+    // patch bank-relative start sector and the bank selector into the unused
+    // patch-zone byte. 0x10 is the existing sentinel value, so Bank 0 keeps
+    // the exact legacy runtime value.
     settings->lba_start = game->start_sector;
+    settings->common.padding = HDD_BANK_PATCH_BIAS ^ (u8)game->bank_index;
 
     if (configGetStrCopy(configSet, CONFIG_ITEM_ALTSTARTUP, filename, sizeof(filename)) == 0)
         strcpy(filename, game->startup);
 
-    if (gPS2Logo)
-        EnablePS2Logo = CheckPS2Logo(0, game->start_sector + OPL_HDD_MODE_PS2LOGO_OFFSET);
+    // The legacy EE-side PS2-logo and ZSO pre-probes use 32-bit Bank-0 reads.
+    // Keep them unchanged for Bank 0. Upper-bank launch validation deliberately
+    // bypasses these optional probes; game-time cdvdman performs bank-aware I/O.
+    if (game->bank_index == 0) {
+        if (gPS2Logo)
+            EnablePS2Logo = CheckPS2Logo(0, game->start_sector + OPL_HDD_MODE_PS2LOGO_OFFSET);
 
-    // Check for ZSO to correctly adjust layer1 start
-    settings->common.layer1_start = 0; // cdvdman will read it from APA header
-    hddReadSectors(game->start_sector + OPL_HDD_MODE_PS2LOGO_OFFSET, 1, IOBuffer);
-    if (*(u32 *)IOBuffer == ZSO_MAGIC) {
-        probed_fd = 0;
-        probed_lba = game->start_sector + OPL_HDD_MODE_PS2LOGO_OFFSET;
-        ziso_init((ZISO_header *)IOBuffer, *(u32 *)((u8 *)IOBuffer + sizeof(ZISO_header)));
-        ziso_read_sector(IOBuffer, 16, 1);
-        u32 maxLBA = *(u32 *)(IOBuffer + 80);
-        if (maxLBA > 0 && maxLBA < ziso_total_block) {   // dual layer check
-            settings->common.layer1_start = maxLBA - 16; // adjust second layer start
+        // Check for ZSO to correctly adjust layer1 start
+        settings->common.layer1_start = 0; // cdvdman will read it from APA header
+        hddReadSectors(game->start_sector + OPL_HDD_MODE_PS2LOGO_OFFSET, 1, IOBuffer);
+        if (*(u32 *)IOBuffer == ZSO_MAGIC) {
+            probed_fd = 0;
+            probed_lba = game->start_sector + OPL_HDD_MODE_PS2LOGO_OFFSET;
+            ziso_init((ZISO_header *)IOBuffer, *(u32 *)((u8 *)IOBuffer + sizeof(ZISO_header)));
+            ziso_read_sector(IOBuffer, 16, 1);
+            u32 maxLBA = *(u32 *)(IOBuffer + 80);
+            if (maxLBA > 0 && maxLBA < ziso_total_block) {   // dual layer check
+                settings->common.layer1_start = maxLBA - 16; // adjust second layer start
+            }
         }
+    } else {
+        settings->common.layer1_start = 0;
     }
 
     if (gAutoLaunchGame == NULL)
@@ -725,33 +792,35 @@ static int hddLoadGameListCache(hdl_games_list_t *cache)
 
     hddFreeHDLGamelist(cache);
 
-    sprintf(filename, "%sgames.bin", gHDDPrefix);
+    // Do not reuse upstream games.bin: hdl_game_info_t now includes bank_index.
+    sprintf(filename, "%s%s", gHDDPrefix, HDD_BANKED_CACHE_FILE);
     file = fopen(filename, "rb");
     if (file != NULL) {
         fseek(file, 0, SEEK_END);
         size = ftell(file);
         rewind(file);
 
+        if (size <= 0 || (size % sizeof(hdl_game_info_t)) != 0) {
+            fclose(file);
+            return EINVAL;
+        }
+
         count = size / sizeof(hdl_game_info_t);
-        if (count > 0) {
-            games = memalign(64, count * sizeof(hdl_game_info_t));
-            if (games != NULL) {
-                if (fread(games, sizeof(hdl_game_info_t), count, file) == count) {
-                    cache->count = count;
-                    cache->games = games;
-                    LOG("hddLoadGameListCache: %d games loaded.\n", count);
-                    result = 0;
-                } else {
-                    LOG("hddLoadGameListCache: I/O error.\n");
-                    free(games);
-                    result = EIO;
-                }
+        games = memalign(64, count * sizeof(hdl_game_info_t));
+        if (games != NULL) {
+            if (fread(games, sizeof(hdl_game_info_t), count, file) == count) {
+                cache->count = count;
+                cache->games = games;
+                LOG("hddLoadGameListCache: %d bank-aware games loaded.\n", count);
+                result = 0;
             } else {
-                LOG("hddLoadGameListCache: failed to allocate memory.\n");
-                result = ENOMEM;
+                LOG("hddLoadGameListCache: I/O error.\n");
+                free(games);
+                result = EIO;
             }
         } else {
-            result = -1; // Empty file
+            LOG("hddLoadGameListCache: failed to allocate memory.\n");
+            result = ENOMEM;
         }
 
         fclose(file);
@@ -775,12 +844,13 @@ static int hddUpdateGameListCache(hdl_games_list_t *cache, hdl_games_list_t *gam
         modified = 0;
         for (i = 0; i < cache->count; i++) {
             for (j = 0; j < game_list->count; j++) {
-                if (strncmp(cache->games[i].partition_name, game_list->games[j].partition_name, APA_IDMAX + 1) == 0)
+                if (cache->games[i].bank_index == game_list->games[j].bank_index &&
+                    strncmp(cache->games[i].partition_name, game_list->games[j].partition_name, APA_IDMAX + 1) == 0)
                     break;
             }
 
             if (j == game_list->count) {
-                LOG("hddUpdateGameListCache: game added.\n");
+                LOG("hddUpdateGameListCache: game added or moved bank.\n");
                 modified = 1;
                 break;
             }
@@ -796,9 +866,9 @@ static int hddUpdateGameListCache(hdl_games_list_t *cache, hdl_games_list_t *gam
 
     if (!modified)
         return 0;
-    LOG("hddUpdateGameListCache: caching new game list.\n");
+    LOG("hddUpdateGameListCache: caching new bank-aware game list.\n");
 
-    sprintf(filename, "%sgames.bin", gHDDPrefix);
+    sprintf(filename, "%s%s", gHDDPrefix, HDD_BANKED_CACHE_FILE);
     if (game_list->count > 0) {
         file = fopen(filename, "wb");
         if (file != NULL) {

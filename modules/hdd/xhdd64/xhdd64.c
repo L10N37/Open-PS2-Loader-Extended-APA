@@ -90,6 +90,31 @@ static int xhdd64Devctl(iop_file_t *fd, const char *name, int cmd, void *arg, un
             return ata_device_sector_io64(fd->unit, buf, lba, sectors, ATA_DIR_READ);
         }
 
+        case ATA_DEVCTL_GET_TOTAL_SECTORS64: {
+            hddLba64_t *result;
+            int identifyResult;
+
+            if (buf == NULL || buflen < sizeof(hddLba64_t))
+                return -EINVAL;
+
+            identifyResult = ata_device_identify(fd->unit, &deviceIdentifyData);
+            if (identifyResult != 0)
+                return identifyResult;
+
+            result = (hddLba64_t *)buf;
+
+            if (deviceIdentifyData.CommandSetSupport.BigLba) {
+                // IDENTIFY words 100-103: total number of 48-bit-LBA user sectors.
+                result->lo = deviceIdentifyData.Max48BitLBA[0];
+                result->hi = deviceIdentifyData.Max48BitLBA[1];
+            } else {
+                result->lo = deviceIdentifyData.UserAddressableSectors;
+                result->hi = 0;
+            }
+
+            return 0;
+        }
+
         default:
             return -EINVAL;
     }

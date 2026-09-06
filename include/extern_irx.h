@@ -140,6 +140,4 @@ IMPORT_BIN2C(usb_pademu_irx);
 
 IMPORT_BIN2C(xhdd_irx);
 
-IMPORT_BIN2C(xhdd64_irx);
-
 #endif

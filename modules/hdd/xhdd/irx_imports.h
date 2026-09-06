@@ -5,6 +5,7 @@
 
 #include <atad.h>
 #include <ioman.h>
+#include <loadcore.h>
 #include <sysclib.h>
 
 #endif

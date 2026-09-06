@@ -27,8 +27,12 @@ typedef struct // size = 1024
     } part_specs[65];
 } hdl_apa_header;
 
-#define HDL_GAME_DATA_OFFSET 0x100000 // Sector 0x800 in the extended attribute area.
-#define HDL_FS_MAGIC         0x1337
+#define HDL_GAME_DATA_OFFSET    0x100000 // Extended attribute data offset.
+#define HDL_GAME_HEADER_OFFSET  ((HDL_GAME_DATA_OFFSET + 4096) / 512) // 0x101000 bytes -> 0x808 sectors.
+#define HDL_FS_MAGIC            0x1337
+#define HDD_BANK_SECTORS        0x100000000ULL
+#define HDD_MAX_BANKS           256
+#define HDD_BANK_SCAN_MAX_PARTS 4096
 
 u8 IOBuffer[2048] ALIGNED(64); // one sector
 
@@ -135,18 +139,32 @@ static int hddWriteSectors(u32 lba, u32 nsectors, const void *buf)
 //-------------------------------------------------------------------------
 struct GameDataEntry
 {
-    u32 lba, size;
+    u32 lba;        // Bank-relative HDL metadata sector (main partition + 0x808).
+    u32 size;       // Allocated size in 2048-byte sectors, matching legacy Bank-0 scan.
+    u32 bank_index;
     struct GameDataEntry *next;
     char id[APA_IDMAX + 1];
 };
+
+static u64 hddBankBase(u32 bank_index)
+{
+    return ((u64)bank_index) << 32;
+}
+
+static int hddReadGameSectors(const struct GameDataEntry *game, u32 nsectors, void *buf)
+{
+    if (game->bank_index == 0)
+        return hddReadSectors(game->lba, nsectors, buf);
+
+    return hddReadSectors64(hddBankBase(game->bank_index) + game->lba, nsectors, buf);
+}
 
 static int hddGetHDLGameInfo(struct GameDataEntry *game, hdl_game_info_t *ginfo)
 {
     int ret;
 
-    ret = hddReadSectors(game->lba, 2, IOBuffer);
+    ret = hddReadGameSectors(game, 2, IOBuffer);
     if (ret == 0) {
-
         hdl_apa_header *hdl_header = (hdl_apa_header *)IOBuffer;
 
         strncpy(ginfo->partition_name, game->id, APA_IDMAX);
@@ -163,6 +181,7 @@ static int hddGetHDLGameInfo(struct GameDataEntry *game, hdl_game_info_t *ginfo)
         ginfo->disctype = (u8)hdl_header->discType;
         ginfo->start_sector = game->lba;
         ginfo->total_size_in_kb = game->size * 2; // size * 2048 / 1024 = 2x
+        ginfo->bank_index = game->bank_index;
     } else
         ret = -1;
 
@@ -170,56 +189,224 @@ static int hddGetHDLGameInfo(struct GameDataEntry *game, hdl_game_info_t *ginfo)
 }
 
 //-------------------------------------------------------------------------
-static struct GameDataEntry *GetGameListRecord(struct GameDataEntry *head, const char *partition)
+static struct GameDataEntry *GetGameListRecord(struct GameDataEntry *head, const char *partition, u32 bank_index)
 {
     struct GameDataEntry *current;
 
     for (current = head; current != NULL; current = current->next) {
-        if (!strncmp(current->id, partition, APA_IDMAX)) {
+        if (current->bank_index == bank_index && !strncmp(current->id, partition, APA_IDMAX))
             return current;
-        }
     }
 
     return NULL;
 }
 
+static struct GameDataEntry *AppendGameListRecord(struct GameDataEntry **head, struct GameDataEntry **tail, const char *partition, u32 bank_index)
+{
+    struct GameDataEntry *entry = malloc(sizeof(struct GameDataEntry));
+
+    if (entry == NULL)
+        return NULL;
+
+    memset(entry, 0, sizeof(*entry));
+    strncpy(entry->id, partition, APA_IDMAX);
+    entry->id[APA_IDMAX] = '\0';
+    entry->bank_index = bank_index;
+
+    if (*tail != NULL)
+        (*tail)->next = entry;
+    else
+        *head = entry;
+
+    *tail = entry;
+    return entry;
+}
+
+static int hddApaHeaderChecksumValid(const apa_header_t *header)
+{
+    const u32 *words = (const u32 *)header;
+    u32 checksum = 0;
+    int i;
+
+    if (header->magic != APA_MAGIC)
+        return 0;
+
+    // APA checksum is the sum of the remaining 255 words with word 0 omitted.
+    for (i = 1; i < (int)(sizeof(apa_header_t) / sizeof(u32)); i++)
+        checksum += words[i];
+
+    return checksum == header->checksum;
+}
+
+static int hddReadUpperBankHeader(u32 bank_index, u32 relative_lba, apa_header_t *header)
+{
+    return hddReadSectors64(hddBankBase(bank_index) + relative_lba,
+                            sizeof(apa_header_t) / 512, header);
+}
+
+/* Scan one independent APA bank without mounting it through Sony hdd.irx.
+   Bank 1+ remains read-only at this stage. */
+static int hddScanUpperBank(u32 bank_index, u64 total_sectors, struct GameDataEntry **head, struct GameDataEntry **tail, u32 *count)
+{
+    apa_header_t *header = (apa_header_t *)IOBuffer;
+    const u64 bank_base = hddBankBase(bank_index);
+    const u64 remaining = total_sectors - bank_base;
+    const u64 bank_sectors = remaining < HDD_BANK_SECTORS ? remaining : HDD_BANK_SECTORS;
+    u32 current_lba = 0;
+    u32 previous_lba = 0;
+    unsigned int visited = 0;
+
+    if (bank_sectors < 2)
+        return 0;
+
+    if (hddReadUpperBankHeader(bank_index, 0, header) != 0)
+        return -EIO;
+
+    // A bank is considered present only when sector 0 is a valid ordinary APA MBR.
+    if (!hddApaHeaderChecksumValid(header) || header->start != 0 || strncmp(header->id, "__mbr", 5) != 0)
+        return 0;
+
+    do {
+        u32 next_lba;
+
+        if (visited++ >= HDD_BANK_SCAN_MAX_PARTS) {
+            LOG("HDD bank %u: APA chain exceeded safety limit.\n", bank_index);
+            return -EIO;
+        }
+
+        if (current_lba != 0) {
+            if ((u64)current_lba >= bank_sectors) {
+                LOG("HDD bank %u: APA LBA 0x%08X outside bank.\n", bank_index, current_lba);
+                return -EIO;
+            }
+
+            if (hddReadUpperBankHeader(bank_index, current_lba, header) != 0)
+                return -EIO;
+
+            if (!hddApaHeaderChecksumValid(header) || header->start != current_lba) {
+                LOG("HDD bank %u: invalid APA header at 0x%08X.\n", bank_index, current_lba);
+                return -EIO;
+            }
+
+            if (header->prev != previous_lba) {
+                LOG("HDD bank %u: broken APA prev link at 0x%08X.\n", bank_index, current_lba);
+                return -EIO;
+            }
+        }
+
+        if (header->type == HDL_FS_MAGIC && !(header->flags & APA_FLAG_SUB)) {
+            struct GameDataEntry *entry;
+            u64 allocated_sectors = header->length;
+            u32 i;
+
+            if (header->nsub > APA_MAXSUB) {
+                LOG("HDD bank %u: invalid HDL nsub %u at 0x%08X.\n", bank_index, header->nsub, current_lba);
+                return -EIO;
+            }
+
+            for (i = 0; i < header->nsub; i++) {
+                if ((u64)header->subs[i].start >= bank_sectors ||
+                    (u64)header->subs[i].start + header->subs[i].length > bank_sectors) {
+                    LOG("HDD bank %u: HDL subpartition outside bank.\n", bank_index);
+                    return -EIO;
+                }
+                allocated_sectors += header->subs[i].length;
+            }
+
+            if ((u64)header->start + header->length > bank_sectors ||
+                (u64)header->start + HDL_GAME_HEADER_OFFSET + 2 > bank_sectors) {
+                LOG("HDD bank %u: HDL main partition outside bank.\n", bank_index);
+                return -EIO;
+            }
+
+            entry = AppendGameListRecord(head, tail, header->id, bank_index);
+            if (entry == NULL)
+                return -ENOMEM;
+
+            entry->lba = header->start + HDL_GAME_HEADER_OFFSET;
+            entry->size = (u32)(allocated_sectors / 4); // 512-byte sectors -> 2048-byte sectors.
+            (*count)++;
+        }
+
+        next_lba = header->next;
+        if (next_lba == 0)
+            break;
+
+        if (next_lba == current_lba || (u64)next_lba >= bank_sectors) {
+            LOG("HDD bank %u: invalid APA next link 0x%08X.\n", bank_index, next_lba);
+            return -EIO;
+        }
+
+        previous_lba = current_lba;
+        current_lba = next_lba;
+    } while (current_lba != 0);
+
+    return 0;
+}
+
+static int hddScanAdditionalBanks(struct GameDataEntry **head, struct GameDataEntry **tail, u32 *count)
+{
+    u64 total_sectors;
+    u64 last_bank;
+    u32 bank_index;
+    int result;
+
+    result = hddGetTotalSectors64(&total_sectors);
+    if (result != 0) {
+        LOG("HDD: 64-bit capacity query unavailable (%d); Bank 0 only.\n", result);
+        return 0;
+    }
+
+    if (total_sectors <= HDD_BANK_SECTORS)
+        return 0;
+
+    last_bank = (total_sectors - 1) >> 32;
+    if (last_bank >= HDD_MAX_BANKS)
+        last_bank = HDD_MAX_BANKS - 1;
+
+    LOG("HDD: 64-bit capacity detected; scanning %llu additional bank(s).\n", last_bank);
+
+    for (bank_index = 1; bank_index <= (u32)last_bank; bank_index++) {
+        result = hddScanUpperBank(bank_index, total_sectors, head, tail, count);
+        if (result != 0) {
+            // One damaged/unsupported upper bank must not hide valid games from Bank 0
+            // or later banks. Log it and continue with the next physical bank.
+            LOG("HDD: Bank %u scan failed (%d); skipping bank.\n", bank_index, result);
+        }
+    }
+
+    return 0;
+}
+
 int hddGetHDLGamelist(hdl_games_list_t *game_list)
 {
-    struct GameDataEntry *head, *current, *next, *pGameEntry;
+    struct GameDataEntry *head, *tail, *current, *next, *pGameEntry;
     unsigned int count, i;
     iox_dirent_t dirent;
     int fd, ret;
 
     hddFreeHDLGamelist(game_list);
 
+    head = tail = NULL;
+    count = 0;
     ret = 0;
+
+    // Bank 0 remains entirely on the existing Sony hdd.irx directory path.
     if ((fd = fileXioDopen("hdd0:")) >= 0) {
-        head = current = NULL;
-        count = 0;
         while (fileXioDread(fd, &dirent) > 0) {
             if (dirent.stat.mode == HDL_FS_MAGIC) {
-                if ((pGameEntry = GetGameListRecord(head, dirent.name)) == NULL) {
-                    if (head == NULL) {
-                        current = head = malloc(sizeof(struct GameDataEntry));
-                    } else {
-                        current = current->next = malloc(sizeof(struct GameDataEntry));
-                    }
-
-                    if (current == NULL)
+                if ((pGameEntry = GetGameListRecord(head, dirent.name, 0)) == NULL) {
+                    pGameEntry = AppendGameListRecord(&head, &tail, dirent.name, 0);
+                    if (pGameEntry == NULL) {
+                        ret = -ENOMEM;
                         break;
-
-                    strncpy(current->id, dirent.name, APA_IDMAX);
-                    current->id[APA_IDMAX] = '\0';
+                    }
                     count++;
-                    current->next = NULL;
-                    current->size = 0;
-                    current->lba = 0;
-                    pGameEntry = current;
                 }
 
                 if (!(dirent.stat.attr & APA_FLAG_SUB)) {
                     // Note: The APA specification states that there is a 4KB area used for storing the partition's information, before the extended attribute area.
-                    pGameEntry->lba = dirent.stat.private_5 + (HDL_GAME_DATA_OFFSET + 4096) / 512;
+                    pGameEntry->lba = dirent.stat.private_5 + HDL_GAME_HEADER_OFFSET;
                 }
 
                 pGameEntry->size += (dirent.stat.size / 4); // size in HDD sectors * (512 / 2048) = 0.25x
@@ -227,33 +414,36 @@ int hddGetHDLGamelist(hdl_games_list_t *game_list)
         }
 
         fileXioDclose(fd);
-
-        if (head != NULL) {
-            if ((game_list->games = malloc(sizeof(hdl_game_info_t) * count)) != NULL) {
-                memset(game_list->games, 0, sizeof(hdl_game_info_t) * count);
-
-                for (i = 0, current = head; i < count; i++, current = current->next) {
-                    if ((ret = hddGetHDLGameInfo(current, &game_list->games[i])) != 0)
-                        break;
-                }
-
-                if (ret) {
-                    free(game_list->games);
-                    game_list->games = NULL;
-                } else {
-                    game_list->count = count;
-                }
-            } else {
-                ret = ENOMEM;
-            }
-
-            for (current = head; current != NULL; current = next) {
-                next = current->next;
-                free(current);
-            }
-        }
     } else {
         ret = fd;
+    }
+
+    if (ret == 0)
+        hddScanAdditionalBanks(&head, &tail, &count);
+
+    if (ret == 0 && head != NULL) {
+        if ((game_list->games = malloc(sizeof(hdl_game_info_t) * count)) != NULL) {
+            memset(game_list->games, 0, sizeof(hdl_game_info_t) * count);
+
+            for (i = 0, current = head; i < count && current != NULL; i++, current = current->next) {
+                if ((ret = hddGetHDLGameInfo(current, &game_list->games[i])) != 0)
+                    break;
+            }
+
+            if (ret) {
+                free(game_list->games);
+                game_list->games = NULL;
+            } else {
+                game_list->count = count;
+            }
+        } else {
+            ret = -ENOMEM;
+        }
+    }
+
+    for (current = head; current != NULL; current = next) {
+        next = current->next;
+        free(current);
     }
 
     return ret;
@@ -272,6 +462,10 @@ void hddFreeHDLGamelist(hdl_games_list_t *game_list)
 //-------------------------------------------------------------------------
 int hddSetHDLGameInfo(hdl_game_info_t *ginfo)
 {
+    // Upper banks are intentionally read-only during initial validation.
+    if (ginfo->bank_index != 0)
+        return -ENOSYS;
+
     if (hddReadSectors(ginfo->start_sector, 2, IOBuffer) != 0)
         return -EIO;
 
@@ -295,6 +489,10 @@ int hddSetHDLGameInfo(hdl_game_info_t *ginfo)
 int hddDeleteHDLGame(hdl_game_info_t *ginfo)
 {
     char path[38];
+
+    // Upper banks are intentionally read-only during initial validation.
+    if (ginfo->bank_index != 0)
+        return -ENOSYS;
 
     LOG("HDD Delete game: '%s'\n", ginfo->name);
 
